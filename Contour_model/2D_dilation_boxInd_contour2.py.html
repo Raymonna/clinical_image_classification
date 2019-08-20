@@ -1,0 +1,584 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[1]:
+
+
+import os
+import tensorflow as tf
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+gpu_options = tf.GPUOptions(allow_growth=True)
+sess_config = tf.ConfigProto(gpu_options=gpu_options)
+tf.keras.backend.set_session(tf.Session(config=sess_config))
+
+
+# In[2]:
+
+
+import os
+import glob
+#import tqdm
+import numpy as np
+#import pandas as pd
+import multiprocessing
+import pydicom as dicom
+import nibabel as nib
+#from keras import utils as kutils
+from matplotlib import pyplot as plt
+
+def load_image(label_fpath, transpose=False):
+    #encode_name = label_fpath[-39: -7]
+    label_data = nib.load(label_fpath)
+    label_array = label_data.get_fdata()
+    if transpose:
+        label_array = np.transpose(label_array, axes=(2, 1, 0))
+    return  label_array#, encode_name
+
+
+# In[3]:
+
+
+import pandas as pd
+info = pd.read_csv('/data2/pancreas/Nifti_data/data_list.csv')
+
+info['total'] = [1]*len(info)
+pd.DataFrame(info.groupby(['cut', 'type']).sum().total)
+
+
+# In[4]:
+
+
+cd ..
+
+
+# In[35]:
+
+
+import pandas as pd
+info = pd.read_csv('/data2/pancreas/Nifti_data/data_list.csv')
+image_path = "/data2/pancreas/Nifti_data/image"
+label_path = "/data2/pancreas/Nifti_data/label"
+
+
+shape = np.load("Resection_stage1/shape.npz.npy")
+resec = np.load("Resection_stage1/resec.npy")
+y = np.load("Resection_stage1/resec_y.npy")
+tumor_shape = np.load("Resection_stage1/shape_tumor.npy")
+
+
+# In[6]:
+
+
+
+#summarize
+from skimage import measure            # to find shape contour
+import scipy.ndimage as ndi            # to determine shape centrality
+from skimage.feature import corner_harris, corner_subpix, corner_peaks, CENSURE
+#img = tumor_img[..., 50]
+
+def set_to_100(vec):
+    vs = vec.shape[0]
+    if (vs < 100):
+        r = 100 - vs
+        tmp = np.zeros((r, vec.shape[1]))-1
+        vec = np.concatenate(( vec.reshape(-1, vec.shape[1]), tmp), axis = 0)
+    
+    vec = vec[tuple(list(np.round(np.linspace(1, vec.shape[0] - 1, 100)).astype(int) )), :]    
+    return vec
+#closing
+
+def isZero(vec):
+    if (vec == []):
+        return True
+    return False
+
+def cont(img):
+    return max(measure.find_contours(img, .8), key=len)
+
+# let us set the 'brush' to a 6x6 circle
+struct = [[ 0., 0., 1., 1., 0., 0.],
+          [ 0., 1., 1., 1., 1., 0.],  
+          [ 1., 1., 1., 1., 1., 1.], 
+          [ 1., 1., 1., 1., 1., 1.], 
+          [ 1., 1., 1., 1., 1., 1.], 
+          [ 0., 1., 1., 1., 1., 0.],
+          [ 0., 0., 1., 1., 0., 0.]]
+
+num = 80
+
+#closing = cont(ndi.morphology.binary_closing(img > num, structure=struct).astype(img.dtype))
+
+
+# In[7]:
+
+
+def set_to_pixel2(tumor_img, mor_type, num_slice):
+    pixel_t = np.zeros((mor_type.shape[0], 1))
+    for i in range(mor_type.shape[0]):
+        pixel_t[i] = tumor_img[mor_type[i, 0],mor_type[i, 1] , num_slice]
+    return pixel_t
+
+def set_to_pixel1(tumor_img, mor_type, num_slice):
+    pixel_t = np.zeros((mor_type.shape[0], 1))
+    for i in range(mor_type.shape[0]):
+        pixel_t[i] = tumor_img[mor_type[i, 0], num_slice, mor_type[i, 1] ]
+    return pixel_t
+
+def set_to_pixel0(tumor_img, mor_type, num_slice):
+    pixel_t = np.zeros((mor_type.shape[0], 1))
+    for i in range(mor_type.shape[0]):
+        pixel_t[i] = tumor_img[ num_slice, mor_type[i, 0],mor_type[i, 1] ]
+    return pixel_t
+
+
+#New
+def extract_cube(r, img):#cube 210, 220, 90 ;; ranges = [xmin, xmax, ymin, ymax, zmin, zmax]
+    img_tmp = np.zeros((356, 289, 105))
+    #print(img.shape, r)
+    img_tmp[:int(r[1]-r[0]), :int(r[3]-r[2]), :int(r[5]-r[4])] = img[int(r[0]):int(r[1]), int(r[2]):int(r[3]), int(r[4]):int(r[5])]
+    return img_tmp
+
+
+def masking(label, img):
+    for i in range(img.shape[0]):
+        for j in range(img.shape[1]):
+            if label[i, j] == 0 or label[i, j] == 1:
+                img[i, j] = 0
+    return img
+
+def masking2(label, img):
+    for i in range(img.shape[0]):
+        for j in range(img.shape[1]):
+            if label[i, j] != 1:
+                img[i, j] = 0
+    return img
+
+import pandas as pd
+map_df = pd.DataFrame(data={'resec_name': resec, 'shape': np.array(range(182)), 'target':y.reshape(182)})
+
+
+# In[22]:
+
+
+plt.imshow(label[..., 71])
+
+
+# In[8]:
+
+
+tumor_shape2 = np.zeros((len(resec), 6))
+for i , name in enumerate(resec[:1]):
+    label = load_image(os.path.join(label_path, "LB_" + name + ".nii.gz"))
+    for j in range(3):
+        tumor_shape2[i, j*2] = np.min(np.unique(np.where(label != 0)[j]))
+        tumor_shape2[i, j*2+1] = np.max(np.unique(np.where(label != 0)[j]))
+    del label
+
+
+# In[11]:
+
+
+tumor_shape2
+
+
+# In[12]:
+
+
+name = resec[0]
+
+
+# In[13]:
+
+
+img = load_image(os.path.join(image_path, "IM_" + name + ".nii.gz"))
+label = load_image(os.path.join(label_path, "LB_" + name + ".nii.gz"))
+
+
+# In[14]:
+
+
+for i in range(55, 73):
+    plt.imshow(label[..., i])
+    plt.show()
+
+
+# In[29]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[18]:
+
+
+#create 3 contours in 3 dimensions
+#182 identities in total 
+#1. crop into (210, 220, 90) -> dilation ->masking
+#2. erosion for each 60, 70, 80
+#3. store in contours[182, 3, n_{dimension} , 3, 100] #identity, dimension, num_slcie,  contour  ;; num_slice = [210, 200, 90]
+num_identity = len(resec)
+contours = np.zeros((num_identity, 3, 365, 3, 100))
+contour_position = np.zeros((num_identity, 1, 365, 6, 100))
+from scipy import ndimage
+
+
+
+nums = [60, 70, 80]
+for idx, name in enumerate(resec):
+    print(idx)
+    img = load_image(os.path.join(image_path, "IM_" + name + ".nii.gz"))
+    label = load_image(os.path.join(label_path, "LB_" + name + ".nii.gz"))
+    img = extract_cube(tumor_shape[idx], img)
+    label = extract_cube(tumor_shape[idx], label)
+
+#========
+    for i in range(img.shape[2]):
+        
+        num_slice = i
+        label[..., i] = masking(label[..., i], label[..., i])
+        label[..., i] = ndimage.binary_dilation(label[..., i]).astype(label[..., i].dtype)
+        img[..., i] = masking2(label[..., i], img[..., i])
+        for n, num in enumerate(nums):
+
+            o1 = measure.find_contours(ndi.morphology.binary_closing(img[..., i] > num, structure=struct).astype(img.dtype), .8)
+            if(isZero(o1)):
+                contours[idx, 2, i, n, :] = np.zeros((100,))
+            else:
+                closing = cont(ndi.morphology.binary_closing(img[..., i] > num, structure=struct).astype(img[..., i].dtype))
+                contour_position[idx, 0, i, 2*n:2*(n+1), :] = set_to_100(closing).reshape(2, 100)
+                tmp_vector = set_to_pixel2(img, closing.astype(np.int), i)
+                contours[idx, 2, i, n, :] = set_to_100(tmp_vector).reshape(100)
+
+
+#===========      
+    for i in range(img.shape[1]):
+        num_slice = i
+        label[:, i, :] = masking(label[:, i, :], label[:, i, :])
+        label[:, i, :] = ndimage.binary_dilation(label[:, i, :]).astype(label[:, i, :].dtype)
+        img[:, i, :] = masking2(label[:, i, :], img[:, i, :])
+        for n, num in enumerate(nums):
+
+            o1 = measure.find_contours(ndi.morphology.binary_closing(img[:, i, :] > num, structure=struct).astype(img.dtype), .8)
+            if(isZero(o1)):
+                contours[idx, 1, i, n, :] = np.zeros((100,))
+            else:
+                closing = cont(ndi.morphology.binary_closing(img[:, i, :] > num, structure=struct).astype(img[:, i, :].dtype))
+                tmp_vector = set_to_pixel1(img, closing.astype(np.int), i)
+                contours[idx, 1, i, n, :] = set_to_100(tmp_vector).reshape(100)
+        
+#===========    
+    for i in range(img.shape[0]):
+        
+        num_slice = i
+        label[i, :, :] = masking(label[i, :, :], label[i, :, :])
+        label[i, :, :] = ndimage.binary_dilation(label[i, :, :]).astype(label[i, :, :].dtype)
+        img[i, :, :] = masking2(label[i, :, :], img[i, :, :])
+        for n, num in enumerate(nums):
+
+            o1 = measure.find_contours(ndi.morphology.binary_closing(img[i, :, :] > num, structure=struct).astype(img.dtype), .8)
+            if(isZero(o1)):
+                contours[idx, 0, i, n, :] = np.zeros((100,))
+            else:
+                closing = cont(ndi.morphology.binary_closing(img[i, :, :] > num, structure=struct).astype(img[i, :, :].dtype))
+                tmp_vector = set_to_pixel1(img, closing.astype(np.int), i)
+                contours[idx, 0, i, n, :] = set_to_100(tmp_vector).reshape(100)
+                
+        
+    del img, label
+
+   
+
+
+
+# In[142]:
+
+
+#contours[182, 3, n_{dimension} , 3, 100] 
+num_slice_nonzero_contours = []
+for i in range(182):
+    num_slice_nonzero_contours.append(np.unique(np.where(contours[i, ...]!= 0)[1]).shape[0])
+
+
+# In[146]:
+
+
+plt.scatter(list(range(len(num_slice_nonzero_contours))), num_slice_nonzero_contours)
+
+
+# In[147]:
+
+
+np.median(num_slice_nonzero_contours)
+
+
+# In[129]:
+
+
+contours[0, 2, 16, 1, :]
+
+
+# In[136]:
+
+
+name = resec[2]
+img = load_image(os.path.join(image_path, "IM_" + name + ".nii.gz"))
+label = load_image(os.path.join(label_path, "LB_" + name + ".nii.gz"))
+np.where(label != 0)
+#plt.imshow(img[])
+# plt.show()
+
+
+# In[137]:
+
+
+for i in range(62, 67):
+    plt.imshow(label[..., i])
+    plt.show()
+
+
+# In[92]:
+
+
+tumor_shape2
+
+
+# In[75]:
+
+
+name = resec[0]
+img = load_image(os.path.join(image_path, "IM_" + name + ".nii.gz"))
+label = load_image(os.path.join(label_path, "LB_" + name + ".nii.gz"))
+img = extract_cube(tumor_shape2[0], img)
+label = extract_cube(tumor_shape2[0], label)
+
+
+# In[76]:
+
+
+np.unique(np.where(label != 0)[0])
+
+
+# In[82]:
+
+
+plt.imshow(label[20, ...])
+
+
+# In[91]:
+
+
+def binary_accuracy(y_true, y_pred):
+    return K.mean(K.equal(y_true, K.round(y_pred)), axis=-1)
+
+
+# In[89]:
+
+
+del binary_accuracy
+
+
+# In[114]:
+
+
+from keras.datasets import mnist
+from keras.layers import Input, Dense, Reshape, Flatten, Dropout, multiply, concatenate,  MaxPool2D
+from keras.layers import BatchNormalization, Activation, Embedding, ZeroPadding2D, Lambda
+from keras.layers.advanced_activations import LeakyReLU, ReLU
+from keras.layers.convolutional import UpSampling2D, Conv2D, Conv1D
+from keras.models import Sequential, Model
+from keras.optimizers import Adam
+from keras.utils import to_categorical
+import keras.backend as K
+import matplotlib.pyplot as plt
+import numpy as np
+from keras import metrics
+import pandas as pd
+import numpy as np
+from keras.models import Sequential
+from keras.layers import Dense, Dropout, Activation, Flatten, LSTM, TimeDistributed, RepeatVector, Reshape
+from keras.layers.normalization import BatchNormalization
+from keras.optimizers import Adam
+from keras.callbacks import EarlyStopping, ModelCheckpoint
+import matplotlib.pyplot as plt
+import tensorflow as tf
+get_ipython().run_line_magic('matplotlib', 'inline')
+import keras
+
+
+# In[126]:
+
+
+
+
+
+# In[127]:
+
+
+inputA = Input(shape=(220, 3, 100,1 ))
+init = 'relu'
+tmp_x = TimeDistributed(Conv2D(64, (3, 3), padding = 'same',  activation = init), input_shape = (220, 3, 100,1 ))(inputA)
+x = TimeDistributed(Conv2D(64, (3, 3), 
+                                 kernel_initializer = tf.keras.initializers.glorot_normal(seed=None),padding = 'same', activation = init))(tmp_x)
+x = Dropout(0.5)(x)
+
+x = TimeDistributed(Conv2D(32, (3, 3), 
+                                 kernel_initializer = tf.keras.initializers.glorot_normal(seed=None),padding = 'same', activation = init))(x)
+x = TimeDistributed(Conv2D(32, (3, 3), 
+                                 kernel_initializer = tf.keras.initializers.glorot_normal(seed=None),padding = 'same', activation = init))(x)
+
+x = Dropout(0.5)(x)
+
+
+x = TimeDistributed(Conv2D(16, (3, 3), 
+                                 kernel_initializer = tf.keras.initializers.glorot_normal(seed=None),padding = 'same', activation = init))(x)
+x = TimeDistributed(Conv2D(16, (3, 3), 
+                                 kernel_initializer = tf.keras.initializers.glorot_normal(seed=None),padding = 'same', activation = init))(x)
+
+x = Dropout(0.5)(x)
+
+x = TimeDistributed(Conv2D(8, (3, 3), 
+                                 kernel_initializer = tf.keras.initializers.glorot_normal(seed=None),padding = 'same', activation = init))(x)
+x = TimeDistributed(Conv2D(8, (3, 3), 
+                                 kernel_initializer = tf.keras.initializers.glorot_normal(seed=None),padding = 'same', activation = init))(x)
+x = Dropout(0.5)(x)
+
+
+
+#x = concatenate([x, tmp_x], axis = -1)
+x = TimeDistributed(Flatten())(x)
+x = TimeDistributed(Dense(150,kernel_initializer = tf.keras.initializers.glorot_normal(seed=None), activation= init))(x)
+x = Dropout(0.5)(x)
+
+
+x = LSTM(150, return_sequences = False, dropout = 0.5)(x)
+x = Dropout(0.5)(x)
+x = Model(inputs=inputA, outputs=x)
+
+#==========
+inputB = Input(shape=(6,))
+tmp_y = Dense(100,kernel_initializer = tf.keras.initializers.glorot_normal(seed=None), activation=init)(inputB)
+y = Dropout(0.5)(tmp_y)
+y = Dense(50,kernel_initializer = tf.keras.initializers.glorot_normal(seed=None), activation=init)(y)
+y = Dropout(0.5)(y)
+
+y = Dense(1 ,kernel_initializer = tf.keras.initializers.glorot_normal(seed=None), activation=init)(y)
+y = concatenate([y, inputB])
+y = Model(inputs=inputB, outputs=y)
+
+#========
+combined = concatenate([x.output, y.output])
+#=======
+
+z = Dense(151,kernel_initializer = tf.keras.initializers.glorot_normal(seed=None), activation=init)(combined)
+z = Dropout(0.5)(z)
+z = Dense(10,kernel_initializer = tf.keras.initializers.glorot_normal(seed=None), activation="selu")(z)
+z = Dense(1, activation="selu")(z)
+#========
+model = Model(inputs=[x.input, y.input], outputs=z)
+model.summary()
+
+
+# In[128]:
+
+
+adam_lr = 0.0002
+adam_beta_1 = 0.5
+model.compile(optimizer=Adam(lr=adam_lr, beta_1=adam_beta_1),
+              loss='binary_crossentropy', metrics = [binary_accuracy])
+
+
+# In[50]:
+
+
+contours[:-50, 2, :220,  :, :].shape
+
+
+# In[51]:
+
+
+np.expand_dims(contours[:-50, 2, :220, :, :], axis = 5).shape
+
+
+# In[55]:
+
+
+np.expand_dims(tumor_shape, axis = 2).shape
+
+
+# In[131]:
+
+
+y = np.load("Resection_stage1/resec_y.npy")
+
+
+# In[132]:
+
+
+# model.fit( tumor_shape[:-50, :], y[:-50], epochs = 10, batch_size = 2)
+
+
+# In[129]:
+
+
+# model.fit([np.expand_dims(contours[:-50, 2, :220, :, :], axis = 5), tumor_shape[:-50, :]], y[:-50], epochs = 10, batch_size = 2)
+
+
+# In[135]:
+
+
+hist = model.fit([np.expand_dims(contours[:-30, 2, :220, :, :], axis = 5), tumor_shape[:-30, :]], y[:-30], epochs = 100, batch_size = 2, validation_split=0.15)
+
+
+# In[66]:
+
+
+np.unique(np.where(contours[:-50, 2, :220, :, :]!= 0)[1])
+
+
+# In[137]:
+
+
+y_pred = model.predict([np.expand_dims(contours[-30:, 2, :220, :, :], axis = 5), tumor_shape[-30:, :]])
+
+
+# In[101]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
